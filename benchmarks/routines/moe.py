@@ -239,8 +239,8 @@ def parse_moe_args(line, parser):
         type=str,
         required=False,
         default="base",
-        choices=["base", "fp8", "nvfp4"],
-        help="Variant for cutlass_fused_moe benchmark: base (no quant), fp8 (per-tensor), nvfp4 (fp4 blockscale)",
+        choices=["base", "fp8", "nvfp4", "w4a8"],
+        help="Variant for cutlass_fused_moe benchmark: base (no quant), fp8 (per-tensor), nvfp4 (fp4 blockscale), w4a8 (INT4 weights + FP8 activations, SM90 only)",
     )
     parser.add_argument(
         "--quantized_input",
@@ -782,6 +782,7 @@ def testCutlassFusedMoe(args):
       - base: no quantization
       - fp8: per-tensor fp8 for weights and activation scale
       - nvfp4: FP4 block-scale weights, optional quantized input
+      - w4a8: INT4 packed weights + FP8 activations (SM90 only)
     Supports TP/EP via tp_size/tp_rank and ep_size/ep_rank.
     """
     if args.verbose >= 1:
@@ -1053,6 +1054,105 @@ def testCutlassFusedMoe(args):
             w2_q,
             out,
         )
+
+    elif variant == "w4a8":
+        # W4A8: INT4 packed weights + FP8 activations (SM90 only)
+        sm = torch.cuda.get_device_capability()[0] * 10 + torch.cuda.get_device_capability()[1]
+        if sm < 90:
+            raise RuntimeError(
+                "W4A8 cutlass_fused_moe is only supported on SM90+. "
+                f"Current device has compute capability {sm // 10}.{sm % 10}."
+            )
+        e = w31_local.shape[0]
+        n_local = w31_local.shape[1] // 2  # local intermediate size (after TP shard)
+        k = hidden_size
+        if n_local % 2 != 0 or k % 2 != 0:
+            raise ValueError(
+                "W4A8 requires (intermediate_size // tp_size) and hidden_size to be divisible by 2 (packed layout)."
+            )
+        group_size = 128
+        if k % group_size != 0 or n_local % group_size != 0:
+            raise ValueError(
+                "W4A8 requires hidden_size and (intermediate_size // tp_size) to be divisible by 128 (group size)."
+            )
+
+        def _interleave_weights(w: torch.Tensor, dim: int) -> torch.Tensor:
+            # Match TRT-LLM quantization layout
+            interleave_factor = 4 if dim % 512 == 0 else (2 if dim % 256 == 0 else 1)
+            s = w.shape
+            return (
+                w.reshape(s[0], s[1], s[2] // interleave_factor, interleave_factor)
+                .permute(0, 2, 1, 3)
+                .reshape(s[0], s[2] // interleave_factor, s[1] * interleave_factor)
+                .contiguous()
+            )
+
+        affine_coeff = 0.005
+
+        w1_weight = torch.randint(0, 256, (e, n_local, k // 2), dtype=torch.uint8, device=device)
+        w2_weight = torch.randint(0, 256, (e, k, n_local // 2), dtype=torch.uint8, device=device)
+        w3_weight = torch.randint(0, 256, (e, n_local, k // 2), dtype=torch.uint8, device=device)
+        w1_scale = torch.randn(e, n_local, k // group_size, dtype=input_dtype, device=device) * affine_coeff
+        w2_scale = torch.randn(e, k, n_local // group_size, dtype=input_dtype, device=device) * affine_coeff
+        w3_scale = torch.randn(e, n_local, k // group_size, dtype=input_dtype, device=device) * affine_coeff
+        w1_pre_quant_scale = torch.rand(e, k, dtype=input_dtype, device=device) * 0.1 + 0.95
+        w2_pre_quant_scale = torch.rand(e, n_local, dtype=input_dtype, device=device) * 0.1 + 0.95
+        w3_pre_quant_scale = torch.rand(e, k, dtype=input_dtype, device=device) * 0.1 + 0.95
+        input_scale = torch.rand(e, 1, dtype=torch.float32, device=device) * 0.2 + 0.1
+        weight_scale_2 = torch.ones(e, 1, dtype=torch.float32, device=device)
+
+        fc1_weights = torch.cat([w3_weight, w1_weight], dim=1).contiguous()
+        fc2_weights = w2_weight
+
+        w3_w1_scales = torch.cat([w3_scale, w1_scale], dim=1)
+        w3_w1_scales_int = _interleave_weights(w3_w1_scales, k)
+        w2_scales_int = _interleave_weights(w2_scale, n_local)
+        w3_w1_pre_quant_max = torch.max(w1_pre_quant_scale, w3_pre_quant_scale)
+        w3_w1_input_scale_max = input_scale.max()
+        fc31_act_scale = (w3_w1_pre_quant_max / w3_w1_input_scale_max).to(input_dtype)
+        fc2_act_scale = (w2_pre_quant_scale / input_scale).to(input_dtype).unsqueeze(-1)
+        fc31_alpha = (weight_scale_2.squeeze(-1) * w3_w1_input_scale_max).float()
+        fc2_alpha = (weight_scale_2.squeeze(-1) * input_scale.squeeze(-1)).float()
+
+        zero_1 = torch.empty(0, dtype=input_dtype, device=device)
+        zero_2 = torch.empty(0, dtype=input_dtype, device=device)
+
+        w3_w1_scales_out = w3_w1_scales_int.to(torch.bfloat16).view(input_dtype)
+        w2_scales_out = w2_scales_int.to(torch.bfloat16).view(input_dtype)
+        fc31_act_out = fc31_act_scale.to(torch.bfloat16).view(input_dtype)
+        fc2_act_out = fc2_act_scale.to(torch.bfloat16).view(input_dtype)
+
+        quant_scales = (
+            w3_w1_scales_out,
+            w2_scales_out,
+            fc31_act_out,
+            fc2_act_out,
+            zero_1,
+            zero_2,
+            fc31_alpha,
+            fc2_alpha,
+        )
+
+        def run_cutlass(x_in, selected_experts_in, routing_weights_in, fc1_w, fc2_w, out_in):
+            return cutlass_fused_moe(
+                x_in,
+                selected_experts_in.to(torch.int),
+                routing_weights_in,
+                fc1_w.view(torch.uint8),
+                fc2_w.view(torch.uint8),
+                input_dtype,
+                tp_size=tp_size,
+                tp_rank=tp_rank,
+                ep_size=ep_size,
+                ep_rank=ep_rank,
+                quant_scales=quant_scales,
+                use_w4_group_scaling=True,
+                use_packed_weights=True,
+                output=out_in,
+            )
+
+        input_args_for_bench = (x, selected_experts, routing_weights, fc1_weights, fc2_weights, out)
+
     else:
         raise ValueError(f"Unknown cutlass_variant: {variant}")
 
