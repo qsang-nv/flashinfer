@@ -276,6 +276,12 @@ def parse_moe_args(line, parser):
         default=0,
         help="Expert parallel rank for cutlass_fused_moe.",
     )
+    parser.add_argument(
+        "--balanced_routing",
+        action="store_true",
+        default=False,
+        help="Use perfectly balanced routing (each expert gets exactly num_tokens*top_k/num_experts tokens).",
+    )
 
     args = parser.parse_args(line)
 
@@ -843,7 +849,33 @@ def testCutlassFusedMoe(args):
     router_logits = torch.randn(
         num_tokens, num_experts, dtype=input_dtype, device=device
     )
-    routing_weights, selected_experts = compute_routing(router_logits, top_k)
+    if getattr(args, "balanced_routing", False):
+        total_pairs = num_tokens * top_k
+        tokens_per_expert = total_pairs // num_experts
+        assert total_pairs % num_experts == 0, (
+            f"balanced_routing requires num_tokens*top_k ({total_pairs}) "
+            f"to be divisible by num_experts ({num_experts})"
+        )
+        expert_ids = torch.arange(num_experts, device=device).repeat(tokens_per_expert)
+        expert_ids = expert_ids[torch.randperm(total_pairs, device=device)]
+        selected_experts = expert_ids.reshape(num_tokens, top_k)
+        routing_weights = torch.ones(num_tokens, top_k, dtype=torch.float32, device=device) / top_k
+        if args.verbose >= 1:
+            print(f"[INFO] Balanced routing: each expert gets exactly {tokens_per_expert} tokens")
+    else:
+        router_logits = torch.randn(
+            num_tokens, num_experts, dtype=input_dtype, device=device
+        )
+        routing_weights, selected_experts = compute_routing(router_logits, top_k)
+
+    # Print per-expert token distribution
+    expert_hist = torch.bincount(
+        selected_experts.reshape(-1).to(torch.int64), minlength=num_experts
+    )
+    print(f"[INFO] Tokens per expert: min={expert_hist.min().item()}, max={expert_hist.max().item()}, "
+          f"mean={expert_hist.float().mean().item():.1f}, std={expert_hist.float().std().item():.1f}")
+    if args.verbose >= 1:
+        print(f"[INFO] Per-expert distribution: {expert_hist.cpu().tolist()}")
 
     if args.verbose >= 2:
         print(f"[VVERBOSE] x.shape = {x.shape}")
